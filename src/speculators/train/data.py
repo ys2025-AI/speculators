@@ -1,3 +1,4 @@
+import contextlib
 import json
 import logging
 import math
@@ -301,6 +302,7 @@ class ArrowDataset(BaseDataset):
         dataset_item = self.data[index]
         client_item = build_client_item(dataset_item)
 
+        handle: str | None = None
         try:
             handle = generate_hidden_states(
                 self.client,  # type:ignore[arg-type]
@@ -322,9 +324,21 @@ class ArrowDataset(BaseDataset):
                     self.transfer.cache(handle, file_idx)
                 case "delete":
                     self.transfer.delete(handle)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
+            # Clean up if on_generate=delete didn't run (e.g. the check
+            # raised before the delete step).
+            if handle is not None:
+                with contextlib.suppress(Exception):
+                    self.transfer.delete(handle)
             if isinstance(e, ValueError) and "NaN" in str(e):
-                raise
+                # vLLM may emit NaN for some inputs; skip the sample
+                # rather than aborting the run.
+                warnings.warn(
+                    f"Hidden states for sample {index} contain NaN values; "
+                    f"skipping sample.",
+                    stacklevel=1,
+                )
+                return None
             warnings.warn(
                 f"Failed to load/cache hidden states for sample {index}: {e}",
                 stacklevel=1,
