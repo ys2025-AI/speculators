@@ -1,5 +1,7 @@
 """Tests for CLI arguments."""
 
+import pytest
+
 from scripts.train import parse_args
 from speculators.models.dflash.core import DFlashDraftModel
 from speculators.models.dspark.core import DSparkDraftModel
@@ -169,3 +171,59 @@ def test_no_norm_before_fc_flag(monkeypatch):
 def test_no_norm_output_flag(monkeypatch):
     args = _parse(monkeypatch, ["--no-norm-output"])
     assert args.norm_output is False
+
+
+# ---------------------------------------------------------------------------
+# --init-from-dflash: DSpark backbone init from a DFlash checkpoint
+# ---------------------------------------------------------------------------
+
+
+def test_init_from_dflash_parses(monkeypatch):
+    args = _parse(
+        monkeypatch, ["--speculator-type", "dspark", "--init-from-dflash", "p"]
+    )
+    assert args.init_from_dflash == "p"
+
+
+def test_init_from_dflash_default_empty(monkeypatch):
+    args = _parse(monkeypatch, [])
+    assert args.init_from_dflash == ""
+
+
+def test_init_from_dflash_requires_dspark(monkeypatch):
+    with pytest.raises(SystemExit):
+        _parse(monkeypatch, ["--speculator-type", "eagle3", "--init-from-dflash", "p"])
+
+
+def test_init_from_dflash_conflicts_with_from_pretrained(monkeypatch):
+    with pytest.raises(SystemExit):
+        _parse(
+            monkeypatch,
+            [
+                "--speculator-type",
+                "dspark",
+                "--init-from-dflash",
+                "p",
+                "--from-pretrained",
+                "q",
+            ],
+        )
+
+
+def test_init_from_dflash_compatible_with_draft_config(monkeypatch):
+    """--init-from-dflash borrows backbone weights; --draft-config defines the
+    decoder shape. They can be combined (e.g. both pointing at the same DFlash
+    checkpoint)."""
+    args = _parse(
+        monkeypatch,
+        [
+            "--speculator-type",
+            "dspark",
+            "--init-from-dflash",
+            "p",
+            "--draft-config",
+            "p",
+        ],
+    )
+    assert args.init_from_dflash == "p"
+    assert args.draft_config == "p"

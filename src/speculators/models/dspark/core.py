@@ -1,3 +1,4 @@
+import logging
 from typing import ClassVar
 
 import torch
@@ -10,6 +11,8 @@ from speculators.models.dspark.metrics import compute_metrics
 from speculators.models.dspark.model_definitions import ConfidenceHead, MarkovHead
 from speculators.models.metrics import LossConfig, kl_div_loss, resolve_loss_config
 from speculators.models.utils import conditional_torch_compile
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_LOSS_CONFIG: LossConfig = {"kl_div": (kl_div_loss, 1.0)}
 
@@ -85,7 +88,60 @@ class DSparkDraftModel(DFlashDraftModel):
         model = cls(config=config)
         model.load_vocab_mappings(t2d, d2t)
         model.load_verifier_weights()
+
+        init_from_dflash = kwargs.get("init_from_dflash")
+        if init_from_dflash:
+            model.load_dflash_backbone(init_from_dflash)
         return model
+
+    # State-dict keys excluded when borrowing a DFlash backbone: they are
+    # verifier-derived (embed_tokens/lm_head/verifier_norm, set by
+    # load_verifier_weights) or vocab-mapping buffers (t2d/d2t, set by
+    # load_vocab_mappings). Preserving the DSpark model's own values keeps the
+    # draft-vocab mapping correct and avoids clobbering frozen verifier weights.
+    _DFLASH_BACKBONE_SKIP_KEYS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "embed_tokens.weight",
+            "lm_head.weight",
+            "verifier_lm_head.weight",
+            "verifier_norm.weight",
+            "t2d",
+            "d2t",
+        }
+    )
+
+    def load_dflash_backbone(self, dflash_path: str) -> None:
+        """Initialize the DSpark draft body from a trained DFlash speculator.
+
+        DSpark inherits DFlash's decoder (layers / fc / hidden_norm / norm)
+        unchanged, so every backbone tensor transfers by name. The Markov and
+        confidence heads -- absent from any DFlash checkpoint -- keep their
+        random ``__init__`` values; verifier-derived weights and vocab-mapping
+        buffers are preserved.
+        """
+        dflash_model = DFlashDraftModel.from_pretrained(dflash_path)
+        src_sd = dflash_model.state_dict()
+        del dflash_model
+
+        backbone_sd = {
+            k: v for k, v in src_sd.items() if k not in self._DFLASH_BACKBONE_SKIP_KEYS
+        }
+        missing, unexpected = self.load_state_dict(backbone_sd, strict=False)
+        if unexpected:
+            raise ValueError(
+                f"--init-from-dflash: DFlash checkpoint '{dflash_path}' contains "
+                f"weights absent from the DSpark model: {unexpected}"
+            )
+        # `missing` are the DSpark-only Markov/confidence head tensors plus the
+        # skipped verifier/vocab keys; they stay at their random / already-loaded
+        # values.
+        logger.info(
+            "--init-from-dflash: loaded %d backbone tensors from '%s' "
+            "(%d DSpark-only tensors left at their current init).",
+            len(backbone_sd),
+            dflash_path,
+            len(missing),
+        )
 
     @staticmethod
     def get_trainer_kwargs(**kwargs) -> tuple[dict, dict]:

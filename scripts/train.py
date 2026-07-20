@@ -770,6 +770,22 @@ def validate_draft_init_args(
         )
 
 
+def _validate_init_from_dflash(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> None:
+    if not args.init_from_dflash:
+        return
+    if args.speculator_type != "dspark":
+        parser.error(
+            "--init-from-dflash is only supported with --speculator-type dspark"
+        )
+    if args.from_pretrained:
+        parser.error(
+            "--init-from-dflash initializes a fresh DSpark draft from a DFlash "
+            "backbone and cannot be combined with --from-pretrained"
+        )
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--verifier-name-or-path", type=str, required=True)
@@ -805,6 +821,21 @@ def parse_args():
         "CLI args. Mutually exclusive with --from-pretrained and with the "
         "decoder-shaping flags (--num-layers, --draft-arch, --draft-hidden-act, "
         "--sliding-window, --full-attention-indices).",
+    )
+    parser.add_argument(
+        "--init-from-dflash",
+        type=str,
+        default="",
+        help=(
+            "Path or HF id of a trained DFlash speculator checkpoint used to "
+            "initialize the DSpark draft backbone (layers/fc/hidden_norm/norm). "
+            "DSpark's Markov and confidence heads -- absent from a DFlash "
+            "checkpoint -- start from random init and are trained normally. "
+            "Only valid with --speculator-type dspark; mutually exclusive with "
+            "--from-pretrained. The DSpark decoder shape (--num-layers / "
+            "--draft-config, --block-size, --target-layer-ids, --mask-token-id, "
+            "--draft-vocab-size) must match the DFlash source checkpoint."
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -1310,6 +1341,9 @@ def parse_args():
 
     provided = explicitly_provided_dests(parser, DECODER_SHAPING_FLAGS)
     validate_draft_init_args(parser, args, provided)
+
+    _validate_init_from_dflash(args, parser)
+
     resolve_loss_config(args.loss_fn)
 
     if args.per_position_loss_weight == "dpace":
