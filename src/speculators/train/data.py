@@ -1,4 +1,5 @@
 import json
+import logging
 import math
 import os
 import random
@@ -23,6 +24,8 @@ from speculators.data_generation.vllm_client import (
     generate_hidden_states,
 )
 from speculators.train.noise_transforms import TransformTensors
+
+logger = logging.getLogger(__name__)
 
 BatchType = dict[str, Any]
 
@@ -245,7 +248,17 @@ class ArrowDataset(BaseDataset):
             raise ValueError("split_ratio must be in range (-1.0, 1.0] excluding 0.0.")
 
         self.transfer = transfer or FileTransfer(Path(datapath) / "hidden_states")
-        self.vllm_endpoint = vllm_endpoint
+        endpoints = [e.strip() for e in vllm_endpoint.split(",") if e.strip()]
+        if len(endpoints) > 1:
+            rank = int(os.environ.get("RANK", "0"))
+            self.vllm_endpoint = endpoints[rank % len(endpoints)]
+            logger.info(
+                "ArrowDataset rank=%d selected vllm endpoint: %s",
+                rank,
+                self.vllm_endpoint,
+            )
+        else:
+            self.vllm_endpoint = endpoints[0] if endpoints else vllm_endpoint
         self.on_missing = on_missing
         self.on_generate = on_generate
         self.client: openai.OpenAI | None = None
