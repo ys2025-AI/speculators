@@ -95,6 +95,9 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             config.transformer_layer_config.hidden_size,
             eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
         )
+        # Optional residual draft adapter (set by subclasses, e.g. DSpark with
+        # draft_adapter_rank>0). Applied in _backbone_forward before lm_head.
+        self.draft_adapter: nn.Module | None = None
         self.rotary_emb = Qwen3RotaryEmbedding(config.transformer_layer_config)  # type: ignore[arg-type]
 
         self.fc = nn.Linear(
@@ -402,7 +405,13 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             )
 
         hidden = self.norm(noise_embedding)
-        logits = self.lm_head(hidden)
+        # Apply the residual draft adapter (if any) only on the lm_head path so
+        # the returned `hidden` (used by Markov/confidence heads) stays the raw
+        # decoder output. Adapter starts at zero (identity) so init == DFlash.
+        lm_head_in = hidden
+        if self.draft_adapter is not None:
+            lm_head_in = hidden + self.draft_adapter(hidden)
+        logits = self.lm_head(lm_head_in)
         # shape: [1, num_anchors*block_size, vocab_size]
 
         aligned_loss_mask = loss_mask.clone()[:, anchored_block_indices]

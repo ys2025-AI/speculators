@@ -65,3 +65,16 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
             "hidden state as the confidence-head input."
         ),
     )
+
+    # Draft adapter (Option A'): a small low-rank residual MLP inserted between
+    # the final norm and the (frozen) lm_head. Lets the DFlash decoder + verifier
+    # lm_head stay frozen while the adapter learns to realign the draft logits to
+    # a different convention (e.g. sample_from_anchor=true). 0 = no adapter.
+    draft_adapter_rank: int = Field(
+        default=0,
+        description=(
+            "Rank of the residual draft adapter (Linear(h,r)->GELU->Linear(r,h), "
+            "zero-init last layer so it starts as identity). 0 disables it. "
+            "Use with --freeze-backbone to keep the DFlash decoder + lm_head frozen."
+        ),
+    )

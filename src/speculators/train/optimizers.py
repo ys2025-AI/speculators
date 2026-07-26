@@ -65,7 +65,7 @@ def build_optimizers(model: Module, config) -> list[torch.optim.Optimizer]:
     if config.optimizer == "adamw":
         return [
             torch.optim.AdamW(
-                model.named_parameters(),
+                [p for p in model.parameters() if p.requires_grad],
                 lr=config.lr,
                 weight_decay=config.weight_decay,
             )

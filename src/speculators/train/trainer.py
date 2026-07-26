@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import time
 import warnings
 from pathlib import Path
@@ -16,7 +17,6 @@ from torch.utils.data import DataLoader
 from tqdm import TqdmExperimentalWarning
 from tqdm.rich import tqdm
 from transformers import (
-    get_cosine_schedule_with_warmup,
     get_linear_schedule_with_warmup,
 )
 
@@ -121,6 +121,7 @@ class TrainerConfig(NamedTuple):
     scheduler_warmup_ratio: float | None = None
     scheduler_total_steps: int | None = None
     scheduler_num_cosine_cycles: float = 0.5
+    lr_min: float = 0.0
     checkpoint_freq: float = 1
     save_best: bool = False
     hidden_states_dtype: torch.dtype = torch.bfloat16
@@ -335,8 +336,13 @@ class Trainer:
                 dist.broadcast(param.data, src=0)
             dist.barrier()
 
-        # DDP constructor broadcasts rank 0's params to all ranks
-        self.model = DistributedDataParallel(self.model)  # type: ignore[assignment]
+        # DDP constructor broadcasts rank 0's params to all ranks.
+        # find_unused_parameters=True is needed when some params are frozen
+        # (e.g. --freeze-backbone) so DDP doesn't hang on missing gradients.
+        has_frozen = any(not p.requires_grad for p in self.model.parameters())
+        self.model = DistributedDataParallel(
+            self.model, find_unused_parameters=has_frozen
+        )  # type: ignore[assignment]
 
     def setup_optimizer(self):
         # Setup optimizer(s). The "muon" option returns two optimizers (Muon for the
@@ -365,12 +371,28 @@ class Trainer:
                     num_training_steps=scheduler_total_steps,
                     last_epoch=last_epoch,
                 )
-            return get_cosine_schedule_with_warmup(
-                opt,
-                num_warmup_steps=scheduler_warmup_steps,
-                num_training_steps=scheduler_total_steps,
-                num_cycles=self.config.scheduler_num_cosine_cycles,
-                last_epoch=last_epoch,
+            # Cosine with optional minimum LR floor (--lr-min). After
+            # scheduler_total_steps the LR stays at lr_min instead of 0.
+            base_lrs = [g["lr"] for g in opt.param_groups]
+            warmup = scheduler_warmup_steps
+            total = scheduler_total_steps
+            cycles = self.config.scheduler_num_cosine_cycles
+            lr_min = self.config.lr_min
+
+            def lr_lambda(step: int) -> float:
+                if step < warmup:
+                    return float(step) / max(1, warmup)
+                progress = (step - warmup) / max(1, total - warmup)
+                cosine = 0.5 * (1.0 + math.cos(math.pi * cycles * 2.0 * progress))
+                # Scale cosine from [0, 1] to [lr_min_ratio, 1]
+                if lr_min > 0 and base_lrs:
+                    # Use the first group's base LR as reference
+                    min_ratio = lr_min / base_lrs[0] if base_lrs[0] > 0 else 0.0
+                    return min_ratio + (1.0 - min_ratio) * cosine
+                return cosine
+
+            return torch.optim.lr_scheduler.LambdaLR(
+                opt, lr_lambda, last_epoch=last_epoch
             )
 
         self.schedulers = [make_scheduler(opt) for opt in self.optimizers]

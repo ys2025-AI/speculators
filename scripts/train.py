@@ -673,6 +673,7 @@ def main(args: argparse.Namespace):  # noqa: C901
         scheduler_warmup_ratio=args.scheduler_warmup_ratio,
         scheduler_total_steps=args.scheduler_total_steps,
         scheduler_num_cosine_cycles=args.scheduler_num_cosine_cycles,
+        lr_min=args.lr_min,
         checkpoint_freq=args.checkpoint_freq,
         save_best=args.save_best,
         hidden_states_dtype=hidden_states_dtype,
@@ -935,6 +936,28 @@ def parse_args():
         ),
     )
     parser.add_argument("--save-path", type=str, default="./output/checkpoints")
+    parser.add_argument(
+        "--freeze-backbone",
+        action="store_true",
+        default=False,
+        help=(
+            "Freeze the backbone (decoder layers, fc, hidden_norm, norm) after "
+            "loading from --init-from-dflash. Only Markov and confidence heads "
+            "are trained. Preserves the DFlash model's pre-trained representations."
+        ),
+    )
+    parser.add_argument(
+        "--draft-adapter-rank",
+        type=int,
+        default=0,
+        help=(
+            "Rank of a residual draft adapter (Linear(h,r)->GELU->Linear(r,h), "
+            "zero-init last layer) inserted on the lm_head path. Realigns the "
+            "frozen DFlash decoder's draft logits to a different convention "
+            "(e.g. sample_from_anchor=true) while keeping decoder+lm_head frozen. "
+            "Use with --freeze-backbone. 0 = no adapter (default)."
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--train-data-ratio", type=float, default=0.9)
@@ -1291,6 +1314,18 @@ def parse_args():
     )
     parser.add_argument("--scheduler-total-steps", type=int, default=None)
     parser.add_argument("--scheduler-num-cosine-cycles", type=float, default=0.5)
+    parser.add_argument(
+        "--lr-min",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum LR for cosine scheduler. The cosine decays to this value "
+            "instead of 0, then stays constant. Useful for two-phase training: "
+            "cosine decay for fast convergence, then fixed low LR for continued "
+            "fine-tuning. Requires --scheduler-total-steps to set the cosine "
+            "completion point."
+        ),
+    )
 
     # optimizer
     parser.add_argument(

@@ -2,6 +2,7 @@ import logging
 from typing import ClassVar
 
 import torch
+from torch import nn
 from transformers import PretrainedConfig
 
 from speculators.model import SpeculatorModel
@@ -58,6 +59,19 @@ class DSparkDraftModel(DFlashDraftModel):
             )
             self.confidence_head = ConfidenceHead(input_dim)
 
+        # Option A': residual draft adapter on the lm_head path. Zero-init the
+        # last layer so it starts as identity (== DFlash behavior); only learns
+        # the delta to realign draft logits (e.g. to sample_from_anchor=true)
+        # while the decoder + lm_head stay frozen (use with --freeze-backbone).
+        if config.draft_adapter_rank > 0:
+            r = config.draft_adapter_rank
+            self.draft_adapter = nn.Sequential(
+                nn.Linear(hidden_size, r, bias=False),
+                nn.GELU(),
+                nn.Linear(r, hidden_size, bias=False),
+            )
+            nn.init.zeros_(self.draft_adapter[-1].weight)  # type: ignore[index]
+
     @classmethod
     def from_training_args(
         cls,
@@ -83,6 +97,7 @@ class DSparkDraftModel(DFlashDraftModel):
                 if confidence_head_with_markov_arg is None
                 else confidence_head_with_markov_arg
             ),
+            draft_adapter_rank=kwargs.get("draft_adapter_rank", 0),
         )
 
         model = cls(config=config)
@@ -92,6 +107,24 @@ class DSparkDraftModel(DFlashDraftModel):
         init_from_dflash = kwargs.get("init_from_dflash")
         if init_from_dflash:
             model.load_dflash_backbone(init_from_dflash)
+
+            freeze_backbone = kwargs.get("freeze_backbone", False)
+            if freeze_backbone:
+                head_hints = ("markov_head", "confidence_head", "draft_adapter")
+                frozen_count = 0
+                trainable_count = 0
+                for name, param in model.named_parameters():
+                    if any(h in name for h in head_hints):
+                        param.requires_grad = True
+                        trainable_count += 1
+                    else:
+                        param.requires_grad = False
+                        frozen_count += 1
+                logger.info(
+                    "Frozen backbone: %d params frozen, %d head params trainable",
+                    frozen_count,
+                    trainable_count,
+                )
         return model
 
     # State-dict keys excluded when borrowing a DFlash backbone: they are
