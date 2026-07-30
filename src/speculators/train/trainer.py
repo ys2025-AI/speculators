@@ -127,6 +127,7 @@ class TrainerConfig(NamedTuple):
     hidden_states_dtype: torch.dtype = torch.bfloat16
     log_freq: int = 1
     fsdp_shard: bool = False
+    on_policy_warmup_ratio: float = 0.0
 
 
 def _resolve_scheduler_steps(
@@ -362,6 +363,7 @@ class Trainer:
         scheduler_warmup_steps, scheduler_total_steps = _resolve_scheduler_steps(
             self.config, len(self.train_loader)
         )
+        self._scheduler_total_steps = scheduler_total_steps
 
         def make_scheduler(opt: torch.optim.Optimizer):
             if self.config.scheduler_type == "linear":
@@ -411,6 +413,25 @@ class Trainer:
     def _schedulers_step(self):
         for scheduler in self.schedulers:
             scheduler.step()
+
+    def _update_on_policy_tf_prob(self) -> None:
+        """Compute and inject the scheduled-sampling teacher-forcing probability.
+
+        Linearly decays ``on_policy_tf_prob`` from ``on_policy_warmup_ratio`` to
+        0 over training, so the Markov chain transitions smoothly from
+        teacher-forced to on-policy. Called before every training step.
+        """
+        warmup_ratio = self.config.on_policy_warmup_ratio
+        if warmup_ratio <= 0 or not self.config.train_call_kwargs:
+            return
+        if "on_policy_tf_prob" not in self.config.train_call_kwargs:
+            return
+        total = getattr(self, "_scheduler_total_steps", 0)
+        if total <= 0:
+            return
+        progress = self.global_step / total
+        tf_prob = max(0.0, warmup_ratio * (1.0 - progress))
+        self.config.train_call_kwargs["on_policy_tf_prob"] = tf_prob
 
     def _prepare_resume_skip(self, epoch: int) -> int:
         """Prepare fast-skip state for mid-epoch resume and return skipped steps."""
@@ -485,6 +506,7 @@ class Trainer:
                 self.device_type, dtype=self.config.hidden_states_dtype
             ):
                 timer.mark("fetch")
+                self._update_on_policy_tf_prob()
                 _draft_tokens, loss, metrics = self.model(
                     **gpu_batch, **(self.config.train_call_kwargs or {})
                 )

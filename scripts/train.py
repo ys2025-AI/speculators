@@ -679,6 +679,9 @@ def main(args: argparse.Namespace):  # noqa: C901
         hidden_states_dtype=hidden_states_dtype,
         log_freq=args.log_freq,
         fsdp_shard=args.fsdp_shard,
+        on_policy_warmup_ratio=(
+            args.on_policy_warmup_ratio if args.on_policy_sampling else 0.0
+        ),
     )
     trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)
 
@@ -1202,6 +1205,29 @@ def parse_args():
         type=float,
         default=1.0,
         help="DSpark: weight of the confidence-head BCE term (default: 1.0).",
+    )
+    parser.add_argument(
+        "--on-policy-sampling",
+        action="store_true",
+        default=False,
+        help=(
+            "DSpark: enable on-policy scheduled sampling for the Markov head. "
+            "The Markov chain conditions on the draft's own sampled predictions "
+            "instead of ground-truth predecessors, reducing the train-inference "
+            "exposure bias. A scheduled-sampling ratio linearly decays the "
+            "teacher-forcing probability from --on-policy-warmup-ratio to 0."
+        ),
+    )
+    parser.add_argument(
+        "--on-policy-warmup-ratio",
+        type=float,
+        default=0.5,
+        help=(
+            "DSpark: initial teacher-forcing probability for scheduled sampling, "
+            "linearly decaying to 0 over training. 1.0 = always teacher forcing; "
+            "0.0 = pure on-policy from the start. Only effective with "
+            "--on-policy-sampling. (default: 0.5)"
+        ),
     )
     parser.add_argument(
         "--draft-attn-impl",

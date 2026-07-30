@@ -78,3 +78,28 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
             "Use with --freeze-backbone to keep the DFlash decoder + lm_head frozen."
         ),
     )
+
+    # On-policy scheduled sampling for the Markov head. When enabled, the
+    # Markov chain's predecessor tokens are sampled from the draft's own
+    # logits (on-policy) instead of ground-truth (teacher forcing), eliminating
+    # the train-inference exposure bias. A scheduled-sampling ratio linearly
+    # decays the teacher-forcing probability from on_policy_warmup_ratio to 0
+    # over training, smoothly transitioning from teacher-forced to on-policy.
+    on_policy_sampling: bool = Field(
+        default=False,
+        description=(
+            "Enable on-policy scheduled sampling for the Markov head. Instead of "
+            "always using ground-truth predecessor tokens (teacher forcing), the "
+            "Markov chain conditions on the draft's own sampled predictions, "
+            "matching inference-time behavior and reducing exposure bias."
+        ),
+    )
+    on_policy_warmup_ratio: float = Field(
+        default=0.5,
+        description=(
+            "Initial teacher-forcing probability for scheduled sampling. Linearly "
+            "decays to 0 over training. 1.0 = always teacher forcing (no on-policy); "
+            "0.0 = pure on-policy from the start (may be unstable early in training). "
+            "Only effective when on_policy_sampling=True."
+        ),
+    )

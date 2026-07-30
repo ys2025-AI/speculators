@@ -40,7 +40,7 @@ DATA_PATH="/tmp/dspark_from_dflash_output"
 SAVE_PATH="/tmp/dspark_scratch_output/checkpoints"
 HIDDEN_STATES_PATH="/tmp/dspark_scratch_hidden_states"
 VLLM_PORT=8000
-EPOCHS=5
+EPOCHS=10
 LR=3e-4
 SEQ_LENGTH=4096
 

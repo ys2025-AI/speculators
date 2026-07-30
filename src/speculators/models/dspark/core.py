@@ -98,6 +98,8 @@ class DSparkDraftModel(DFlashDraftModel):
                 else confidence_head_with_markov_arg
             ),
             draft_adapter_rank=kwargs.get("draft_adapter_rank", 0),
+            on_policy_sampling=kwargs.get("on_policy_sampling", False),
+            on_policy_warmup_ratio=kwargs.get("on_policy_warmup_ratio", 0.5),
         )
 
         model = cls(config=config)
@@ -124,6 +126,15 @@ class DSparkDraftModel(DFlashDraftModel):
                     "Frozen backbone: %d params frozen, %d head params trainable",
                     frozen_count,
                     trainable_count,
+                )
+            # Zero-init W2: B = W1 @ W2 = 0 at start -> model starts at backbone-only
+            # performance (no Markov corruption). W2 gradually learns the bigram
+            # correction; W1 stays at its init (random or pre-trained).
+            if hasattr(model, 'markov_head') and hasattr(model.markov_head, 'markov_w2'):
+                model.markov_head.markov_w2.weight.data.zero_()
+                logger.info(
+                    "Zero-initialized markov_w2 (B=0 at start, "
+                    "model starts at backbone-only performance)"
                 )
         return model
 
@@ -187,6 +198,7 @@ class DSparkDraftModel(DFlashDraftModel):
             "per_position_loss_weight", "fixed-exp-decay"
         )
         dpace_alpha = kwargs.get("dpace_alpha", 0.5)
+        on_policy_warmup_ratio = kwargs.get("on_policy_warmup_ratio", 0.0)
         shared = {
             "loss_config": loss_config,
             "gamma": gamma,
@@ -194,8 +206,14 @@ class DSparkDraftModel(DFlashDraftModel):
             "confidence_head_alpha": confidence_head_alpha,
             "per_position_loss_weight": per_position_loss_weight,
             "dpace_alpha": dpace_alpha,
+            "on_policy_tf_prob": on_policy_warmup_ratio,
         }
-        return dict(shared), dict(shared)
+        train_kwargs = dict(shared)
+        val_kwargs = dict(shared)
+        # Validation always uses teacher forcing (on_policy_tf_prob=1.0) for a
+        # clean signal that is comparable across epochs.
+        val_kwargs["on_policy_tf_prob"] = 1.0
+        return train_kwargs, val_kwargs
 
     @conditional_torch_compile
     def forward(
@@ -212,6 +230,7 @@ class DSparkDraftModel(DFlashDraftModel):
         confidence_head_alpha: float = 1.0,
         per_position_loss_weight: str = "fixed-exp-decay",
         dpace_alpha: float = 0.5,
+        on_policy_tf_prob: float = 1.0,
         **kwargs,
     ):
         hidden, logits, targets, aligned_loss_mask, anchored_block_indices = (
@@ -233,32 +252,41 @@ class DSparkDraftModel(DFlashDraftModel):
         mask_tokens_size = num_blocks * block
         # Ground-truth block tokens (verifier vocab); position 0 is the anchor.
         block_tokens = input_ids[0, anchored_block_indices].view(num_blocks, block)
-        if self.config.sample_from_anchor:
-            # With sample_from_anchor=True (DSpark default), slot k predicts
-            # token p+k+1 and the inference Markov chain conditions slot k's
-            # bias on the token at the previous position p+k.
-            prev_token_ids = block_tokens
-        else:
-            # With sample_from_anchor=False (Dflash default), slot k predicts
-            # token p+k, so the previous token within the block is
-            # block_tokens[:, k-1] (shifted).
-            prev_token_ids = torch.cat(
-                [block_tokens[:, :1], block_tokens[:, :-1]], dim=1
-            )  # [num_blocks, block]
         hidden_blocks = hidden.view(num_blocks, block, -1)
+
+        # Determine whether to use the on-policy sequential Markov chain.
+        # Only vanilla/gated heads are per-slot independent and support on-policy;
+        # rnn falls back to teacher forcing (its recurrent state needs special
+        # handling for sampled predecessors).
+        use_on_policy = (
+            self.config.on_policy_sampling
+            and self.markov_head is not None
+            and on_policy_tf_prob < 1.0
+            and self.markov_head.head_type in ("vanilla", "gated")
+        )
 
         confidence_logits = None
         prev_emb = None
         if self.markov_head is not None:
-            prev_emb = self.markov_head.prev_embeddings(prev_token_ids)
-            markov_bias = self.markov_head.block_bias(
-                prev_token_ids=prev_token_ids,
-                hidden_states=hidden_blocks,
-                prev_emb=prev_emb,
-            )
-            logits = (logits.view(num_blocks, block, -1) + markov_bias).view(
-                1, mask_tokens_size, -1
-            )
+            if use_on_policy:
+                prev_emb, logits = self._on_policy_markov_forward(
+                    logits=logits,
+                    block_tokens=block_tokens,
+                    hidden_blocks=hidden_blocks,
+                    num_blocks=num_blocks,
+                    block=block,
+                    mask_tokens_size=mask_tokens_size,
+                    on_policy_tf_prob=on_policy_tf_prob,
+                )
+            else:
+                prev_emb, logits = self._teacher_forced_markov_forward(
+                    logits=logits,
+                    block_tokens=block_tokens,
+                    hidden_blocks=hidden_blocks,
+                    num_blocks=num_blocks,
+                    block=block,
+                    mask_tokens_size=mask_tokens_size,
+                )
 
         if self.confidence_head is not None:
             # confidence_head_with_markov requires markov_rank > 0 (enforced in
@@ -287,3 +315,91 @@ class DSparkDraftModel(DFlashDraftModel):
             sample_from_anchor=self.config.sample_from_anchor,
         )
         return None, loss, metrics
+
+    def _teacher_forced_markov_forward(
+        self,
+        logits: torch.Tensor,
+        block_tokens: torch.Tensor,
+        hidden_blocks: torch.Tensor,
+        num_blocks: int,
+        block: int,
+        mask_tokens_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Original teacher-forced Markov bias (all slots at once, GT predecessors)."""
+        if self.config.sample_from_anchor:
+            prev_token_ids = block_tokens
+        else:
+            prev_token_ids = torch.cat(
+                [block_tokens[:, :1], block_tokens[:, :-1]], dim=1
+            )
+        prev_emb = self.markov_head.prev_embeddings(prev_token_ids)
+        markov_bias = self.markov_head.block_bias(
+            prev_token_ids=prev_token_ids,
+            hidden_states=hidden_blocks,
+            prev_emb=prev_emb,
+        )
+        logits = (logits.view(num_blocks, block, -1) + markov_bias).view(
+            1, mask_tokens_size, -1
+        )
+        return prev_emb, logits
+
+    def _on_policy_markov_forward(
+        self,
+        logits: torch.Tensor,
+        block_tokens: torch.Tensor,
+        hidden_blocks: torch.Tensor,
+        num_blocks: int,
+        block: int,
+        mask_tokens_size: int,
+        on_policy_tf_prob: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """On-policy scheduled-sampling Markov chain.
+
+        Sequentially computes per-slot Markov bias, sampling each slot's
+        predecessor from the draft's own logits (with probability
+        ``1 - on_policy_tf_prob``) or from ground truth (with probability
+        ``on_policy_tf_prob``). The sampled tokens are detached — gradients flow
+        through the Markov head parameters but not through the sampling step.
+        """
+        device = logits.device
+        base_logits_blocks = logits.view(num_blocks, block, -1)
+        final_logits = base_logits_blocks.clone()
+        prev_emb_slots: list[torch.Tensor] = []
+        sampled_prev: torch.Tensor | None = None
+
+        for k in range(block):
+            if k == 0:
+                # Slot 0: predecessor is always the anchor (known at inference).
+                prev_k = block_tokens[:, 0]
+            else:
+                # Determine GT predecessor based on sfa convention.
+                if self.config.sample_from_anchor:
+                    gt_prev = block_tokens[:, k]
+                else:
+                    gt_prev = block_tokens[:, k - 1]
+
+                if on_policy_tf_prob > 0.0:
+                    use_tf = torch.rand(
+                        num_blocks, device=device
+                    ) < on_policy_tf_prob
+                    prev_k = torch.where(use_tf, gt_prev, sampled_prev)
+                else:
+                    prev_k = sampled_prev
+
+            # Markov embedding + bias for slot k (gradients flow here).
+            prev_emb_k = self.markov_head.prev_embeddings(prev_k)
+            prev_emb_slots.append(prev_emb_k)
+            bias_k = self.markov_head.block_bias(
+                prev_token_ids=prev_k.unsqueeze(1),
+                hidden_states=hidden_blocks[:, k : k + 1],
+                prev_emb=prev_emb_k.unsqueeze(1),
+            )
+            final_logits[:, k] = base_logits_blocks[:, k] + bias_k.squeeze(1)
+
+            # Sample token for next slot's predecessor (detached, non-differentiable).
+            if k < block - 1:
+                sampled_prev = final_logits[:, k].float().argmax(dim=-1).detach()
+
+        logits = final_logits.view(1, mask_tokens_size, -1)
+        prev_emb = torch.stack(prev_emb_slots, dim=1)
+        return prev_emb, logits

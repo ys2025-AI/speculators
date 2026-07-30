@@ -72,7 +72,7 @@ HIDDEN_STATES_PATH="/tmp/dspark_hidden_states"  # shared by vLLM (write) & datal
 VLLM_PORT=8000
 MAX_SAMPLES=5000
 SEQ_LENGTH=4096
-EPOCHS=5
+EPOCHS=10
 LR=3e-4
 
 # DSpark parameters -- MUST match the DFlash source ckpt's config.json for
