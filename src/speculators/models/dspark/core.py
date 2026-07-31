@@ -210,9 +210,13 @@ class DSparkDraftModel(DFlashDraftModel):
         }
         train_kwargs = dict(shared)
         val_kwargs = dict(shared)
-        # Validation always uses teacher forcing (on_policy_tf_prob=1.0) for a
-        # clean signal that is comparable across epochs.
-        val_kwargs["on_policy_tf_prob"] = 1.0
+        if on_policy_warmup_ratio > 0:
+            # Warmup mode: validation uses teacher forcing for a clean signal.
+            val_kwargs["on_policy_tf_prob"] = 1.0
+        else:
+            # Pure on-policy mode (warmup=0): validation also uses on-policy
+            # to match inference conditions and give representative metrics.
+            val_kwargs["on_policy_tf_prob"] = 0.0
         return train_kwargs, val_kwargs
 
     @conditional_torch_compile
